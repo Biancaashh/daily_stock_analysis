@@ -1,0 +1,129 @@
+name: A 股盘中异动扫描（14:30-14:50）
+
+on:
+  # 定时触发 - 每天北京时间 14:35 (UTC 06:35)，A 股尾盘时段
+  schedule:
+    - cron: '35 6 * * 1-5'
+
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      min_turnover:
+        description: 最低换手率 %
+        required: true
+        default: '5'
+        type: string
+      max_turnover:
+        description: 最高换手率 %
+        required: true
+        default: '10'
+        type: string
+      min_change:
+        description: 最低涨跌幅 %
+        required: true
+        default: '3'
+        type: string
+      max_change:
+        description: 最高涨跌幅 %
+        required: true
+        default: '5'
+        type: string
+      top:
+        description: 限制输出前 N 只（0=全部）
+        required: false
+        default: '0'
+        type: string
+
+concurrency:
+  group: intraday-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: pip install --upgrade pip && pip install -r requirements.txt
+
+      - name: 盘中实时筛选（换手率 + 涨幅）
+        id: screen
+        env:
+          MIN_TURNOVER: ${{ github.event.inputs.min_turnover || '5' }}
+          MAX_TURNOVER: ${{ github.event.inputs.max_turnover || '10' }}
+          MIN_CHANGE: ${{ github.event.inputs.min_change || '3' }}
+          MAX_CHANGE: ${{ github.event.inputs.max_change || '5' }}
+          TOP_N: ${{ github.event.inputs.top || '0' }}
+        run: |
+          echo "========== A 股盘中异动扫描 =========="
+          echo "⏰ $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
+          echo "📊 条件: 换手率 ${MIN_TURNOVER}%-${MAX_TURNOVER}% + 涨幅 ${MIN_CHANGE}%-${MAX_CHANGE}%"
+          echo ""
+
+          TOP_ARG=""
+          if [ "$TOP_N" != "0" ] && [ -n "$TOP_N" ]; then
+            TOP_ARG="--top $TOP_N"
+          fi
+
+          python scripts/intraday_screening.py \
+            --min-turnover "$MIN_TURNOVER" \
+            --max-turnover "$MAX_TURNOVER" \
+            --min-change "$MIN_CHANGE" \
+            --max-change "$MAX_CHANGE" \
+            --json $TOP_ARG > /tmp/screen_result.json 2>/tmp/screen_debug.log
+
+          EXIT_CODE=$?
+          cat /tmp/screen_debug.log
+          echo ""
+
+          STOCK_COUNT=$(python3 -c "import json; d=json.load(open('/tmp/screen_result.json')); print(d.get('total',len(d.get('stocks',[]))))" 2>/dev/null || echo "0")
+
+          echo "STOCK_COUNT=$STOCK_COUNT" >> $GITHUB_ENV
+
+          if [ "$STOCK_COUNT" -gt 0 ]; then
+            echo "✅ 命中 ${STOCK_COUNT} 只"
+            python3 scripts/intraday_notify.py --table < /tmp/screen_result.json
+          else
+            echo "✅ 当前无符合条件股票"
+          fi
+
+      - name: 推送飞书通知
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        run: |
+          if [ ! -f /tmp/screen_result.json ]; then
+            echo '{"total":0,"stocks":[]}' > /tmp/screen_result.json
+          fi
+
+          if [ -z "$FEISHU_WEBHOOK_URL" ]; then
+            echo "⚠️ FEISHU_WEBHOOK_URL 未配置，跳过通知"
+            exit 0
+          fi
+
+          python3 scripts/intraday_notify.py < /tmp/screen_result.json > /tmp/feishu_msg.json
+
+          echo "📤 推送飞书..."
+          RESPONSE=$(curl -s -X POST "$FEISHU_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/feishu_msg.json)
+
+          echo "响应: $RESPONSE"
+          echo "$RESPONSE" | grep -q '"code":0' && echo "✅ 推送成功" || echo "⚠️ 推送响应异常"
+
+      - name: 运行摘要
+        if: always()
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "📊 盘中异动扫描完成"
+          echo "⏰ $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
+          echo "🎯 命中: ${{ env.STOCK_COUNT }} 只"
+          echo "=========================================="
