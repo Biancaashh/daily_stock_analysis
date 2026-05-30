@@ -56,6 +56,7 @@ jobs:
 
       - name: 盘中实时筛选（换手率 + 涨幅）
         id: screen
+        continue-on-error: true  # 脚本异常不阻断流程
         env:
           MIN_TURNOVER: ${{ github.event.inputs.min_turnover || '5' }}
           MAX_TURNOVER: ${{ github.event.inputs.max_turnover || '10' }}
@@ -73,17 +74,19 @@ jobs:
             TOP_ARG="--top $TOP_N"
           fi
 
+          # 运行筛选脚本，失败时兜底输出空 JSON
           python scripts/intraday_screening.py \
             --min-turnover "$MIN_TURNOVER" \
             --max-turnover "$MAX_TURNOVER" \
             --min-change "$MIN_CHANGE" \
             --max-change "$MAX_CHANGE" \
-            --json $TOP_ARG > /tmp/screen_result.json 2>/tmp/screen_debug.log
+            --json $TOP_ARG > /tmp/screen_result.json 2>/tmp/screen_debug.log || \
+            echo '{"total":0,"stocks":[]}' > /tmp/screen_result.json
 
-          EXIT_CODE=$?
           cat /tmp/screen_debug.log
           echo ""
 
+          # 从 JSON 提取数量
           STOCK_COUNT=$(python3 -c "import json; d=json.load(open('/tmp/screen_result.json')); print(d.get('total',len(d.get('stocks',[]))))" 2>/dev/null || echo "0")
 
           echo "STOCK_COUNT=$STOCK_COUNT" >> $GITHUB_ENV
